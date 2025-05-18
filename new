@@ -1,0 +1,153 @@
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+// Kernel parameters (define appropriately)
+constexpr int kNum    = /* input channels */;
+constexpr int kImSize = /* input image size */;
+constexpr int kKernel = /* kernel size, e.g. 5 */;
+constexpr int chunk   = 12;  // number of channels per iteration
+
+__global__ void cnn_gpu(
+    const float* __restrict__ input,   // [kNum][kImSize][kImSize]
+    const float* __restrict__ weight,  // [kNum][kNum][kKernel][kKernel]
+    const float* __restrict__ bias,    // [kNum]
+    float*       __restrict__ output)  // [kNum][outH][outW]
+{
+    // 1) Identify thread indices
+    int i     = blockIdx.z;
+    int w_out = blockIdx.x * blockDim.x + threadIdx.x;
+    int h_out = blockIdx.y * blockDim.y + threadIdx.y;
+    int convH = kImSize, convW = kImSize;
+    int outH  = convH / 2, outW = convW / 2;
+
+    // 2) Tile geometry
+    const int tileW    = blockDim.x + (kKernel - 1);
+    const int tileH    = blockDim.y + (kKernel - 1);
+    const int tileSize = tileW * tileH;
+    int lane    = threadIdx.y * blockDim.x + threadIdx.x;  // 0..255
+    int totalTh = blockDim.x * blockDim.y;                // 256
+
+    // 3) Shared memory: two buffers for ping-pong
+    extern __shared__ float smem[];
+    float* inputsBuf0 = smem;
+    float* inputsBuf1 = smem + tileSize;
+    __shared__ int ping, flag;
+
+    // 4) Weight buffer
+    __shared__ float wfilter[kNum][kKernel * kKernel];
+    bool isLoader  = (threadIdx.z == 0);
+    bool isCompute = (threadIdx.z == 1);
+
+    // Load filters into shared memory (loader threads)
+    if (isLoader && lane < kNum) {
+        const float* src = weight + ((i * kNum + lane) * kKernel * kKernel);
+        float* dst       = wfilter[lane];
+        #pragma unroll
+        for (int t = 0; t < kKernel * kKernel; ++t)
+            dst[t] = src[t];
+    }
+    __syncthreads();
+
+    // 5) Initialize handshake (loader only)
+    if (isLoader && lane == 0) {
+        ping = 0;
+        flag = 1;  // loader first
+    }
+    __threadfence_block();
+    __syncthreads();
+
+    float acc00 = 0.f, acc01 = 0.f, acc10 = 0.f, acc11 = 0.f;
+
+    // 6) Loop over channels in increments of 'chunk'
+    for (int basej = 0; basej < kNum; basej += chunk) {
+        // A) Loader handshake: wait until flag==1
+        if (isLoader && lane == 0) {
+            while (flag == 0);
+        }
+        __threadfence_block();
+        __syncthreads();
+
+        // B) Loading phase (loader threads only)
+        if (isLoader) {
+            float* loadBuf = (ping == 0 ? inputsBuf0 : inputsBuf1);
+            for (int idx = lane; idx < chunk * tileSize; idx += totalTh) {
+                int ch = idx / tileSize;
+                int t  = idx % tileSize;
+                int ry = t / tileW;
+                int rx = t % tileW;
+                int gy = (blockIdx.y * blockDim.y) * 2 + ry;
+                int gx = (blockIdx.x * blockDim.x) * 2 + rx;
+                int inIndex = ((basej + ch) * convH + gy) * convW + gx;
+                loadBuf[ch * tileSize + t] =
+                    (basej + ch < kNum && gy < convH && gx < convW)
+                    ? input[inIndex]
+                    : 0.f;
+            }
+        }
+        __threadfence_block();
+        __syncthreads();
+
+        // C) Loader signals compute + swap buffer
+        if (isLoader && lane == 0) {
+            flag = 0;
+            ping ^= 1;
+        }
+        __threadfence_block();
+        __syncthreads();
+
+        // D) Compute handshake: wait until flag==0
+        if (isCompute && lane == 0) {
+            while (flag == 1);
+        }
+        __threadfence_block();
+        __syncthreads();
+
+        // E) Compute phase (compute threads only)
+        if (isCompute) {
+            float* compBuf = (ping == 0 ? inputsBuf1 : inputsBuf0);
+            for (int ch = 0; ch < chunk; ++ch) {
+                const float* wptr = wfilter[basej + ch];
+                const float* inptr = compBuf + ch * tileSize;
+                for (int p = 0; p < kKernel; ++p) {
+                    for (int q = 0; q < kKernel; ++q) {
+                        float wv = wptr[p * kKernel + q];
+                        int base = p * tileW + q;
+                        float v00 = inptr[base];
+                        float v01 = inptr[base + 1];
+                        float v10 = inptr[base + tileW];
+                        float v11 = inptr[base + tileW + 1];
+                        acc00 += wv * v00;
+                        acc01 += wv * v01;
+                        acc10 += wv * v10;
+                        acc11 += wv * v11;
+                    }
+                }
+            }
+        }
+        __threadfence_block();
+        __syncthreads();
+
+        // F) Compute signals loader to proceed
+        if (isCompute && lane == 0) {
+            flag = 1;
+        }
+        __threadfence_block();
+        __syncthreads();
+    }
+
+    // 7) Post‐processing (all threads)
+    if (isCompute) {
+        float bval = bias[i];
+        acc00 = fmaxf(acc00 + bval, 0.f);
+        acc01 = fmaxf(acc01 + bval, 0.f);
+        acc10 = fmaxf(acc10 + bval, 0.f);
+        acc11 = fmaxf(acc11 + bval, 0.f);
+        float pool = fmaxf(fmaxf(acc00, acc01), fmaxf(acc10, acc11));
+        if (w_out < outW && h_out < outH) {
+            int outIdx = (i * outH + h_out) * outW + w_out;
+            output[outIdx] = pool;
+        }
+    }
+}
+
+// Launch with: dim3 block(16,16,2);  size uses 2*tileSize*sizeof(float) for shared memory
